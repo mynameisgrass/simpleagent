@@ -108,13 +108,11 @@ jobs:
       # =====================================================================
       # 5. AUTHENTICATE TOOLS
       # =====================================================================
-      - name: "🔑 Authenticate GitHub CLI"
+      - name: "🔑 Verify GitHub CLI authentication"
         run: |
-          # Pipe the token into gh auth login so it creates a proper session.
-          # This fixes the "not logged into any GitHub hosts" error that
-          # occurs when only GH_TOKEN env var is set.
-          echo "$GH_TOKEN" | gh auth login --with-token
-          gh auth status
+          # gh automatically reads GH_TOKEN from the environment for all
+          # API calls — no explicit login needed.  Just verify it works.
+          echo "Authenticated as: $(gh api user --jq '.login')"
 
       - name: "🔑 Verify Vercel authentication"
         run: |
