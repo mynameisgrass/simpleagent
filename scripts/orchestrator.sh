@@ -415,18 +415,60 @@ while true; do
     fi
 
     # =================================================================
-    # PHASE 5: KILL SWITCH
+    # PHASE 5: COMMAND ROUTER
     # =================================================================
-    if echo "$COMMENT_BODY" | grep -qF '!stop'; then
-      log "🛑 Kill switch activated by comment #${COMMENT_ID}"
-      post_comment "$ISSUE_NUMBER" \
-        "🛑 Terminating 3-hour session. Goodbye!
+    if [[ "$COMMENT_BODY" == !* ]]; then
+      COMMAND=$(echo "$COMMENT_BODY" | awk '{print $1}')
+      CMD_ARGS=$(echo "$COMMENT_BODY" | cut -s -d' ' -f2-)
+      
+      log "Intercepted command: ${COMMAND}"
+
+      case "$COMMAND" in
+        !stop)
+          log "🛑 Kill switch activated by comment #${COMMENT_ID}"
+          post_comment "$ISSUE_NUMBER" \
+            "🛑 Terminating 3-hour session. Goodbye!
 
 **Session summary:**
 - 📦 Repository: [${REPO_OWNER}/${PROJECT_NAME}](https://github.com/${REPO_OWNER}/${PROJECT_NAME})
 - 🌐 Last deployment: ${DEPLOY_URL:-'N/A'}
 - ⏱️ Session ended at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-      exit 0
+          exit 0
+          ;;
+
+        !run)
+          reply_to_comment "$ISSUE_NUMBER" "$COMMENT_ID" "⏳ Executing: \`$CMD_ARGS\`..."
+          cd "$WORK_DIR"
+          
+          # Run the command and capture output (with timeout to prevent freezing)
+          CMD_OUTPUT=$(timeout 60s bash -c "$CMD_ARGS" 2>&1) || CMD_EXIT=$?
+          CMD_EXIT=${CMD_EXIT:-0}
+          
+          reply_to_comment "$ISSUE_NUMBER" "$COMMENT_ID" \
+            "**Command execution complete** (Exit code: \`${CMD_EXIT}\`)
+\`\`\`bash
+${CMD_OUTPUT:-"(no output)"}
+\`\`\`"
+          continue # Skip running Aider
+          ;;
+
+        !mobile)
+          reply_to_comment "$ISSUE_NUMBER" "$COMMENT_ID" "📱 Switching to Mobile App mode! Instructing agent to use Expo + GitHub Actions compiler..."
+          COMMENT_BODY="Please convert this project into an Expo (React Native) mobile app. 
+CRITICAL RULES:
+1. Initialize a standard Expo app.
+2. Create a GitHub Actions workflow at \`.github/workflows/build-mobile.yml\` configured to run on \`macos-latest\`.
+3. The workflow must install Node, setup Java/Android SDK, install EAS CLI (Expo), and run local builds to produce an unsigned \`.apk\` and unsigned \`.ipa\`.
+4. The workflow should upload the APK and IPA as GitHub Actions Artifacts.
+$CMD_ARGS"
+          # Don't 'continue', let it fall through to Aider so it generates the code
+          ;;
+
+        *)
+          reply_to_comment "$ISSUE_NUMBER" "$COMMENT_ID" "⚠️ Unknown command: \`${COMMAND}\`. Available: \`!stop\`, \`!run <cmd>\`, \`!mobile\`."
+          continue
+          ;;
+      esac
     fi
 
     # =================================================================
