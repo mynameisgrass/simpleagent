@@ -27,6 +27,9 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    # Link to the "prod" environment where the 4 secrets are stored
+    environment: prod
+
     # Hard ceiling — GitHub will kill the runner after 3 hours
     timeout-minutes: 180
 
