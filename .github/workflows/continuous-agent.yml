@@ -18,8 +18,12 @@ on:
 
 jobs:
   agent-session:
-    # Only fire when the exact label is applied
-    if: github.event.label.name == 'agent-run'
+    # Only fire when:
+    #   1. The label is exactly "agent-run"
+    #   2. The actor (person who labeled) is mynameisgrass
+    if: >-
+      github.event.label.name == 'agent-run'
+      && github.actor == 'mynameisgrass'
 
     runs-on: ubuntu-latest
 
@@ -40,6 +44,31 @@ jobs:
       HUB_REPO: ${{ github.repository }}
 
     steps:
+      # =====================================================================
+      # 0. EARLY FEEDBACK — Post a comment BEFORE any tool setup so the user
+      #    knows the workflow was triggered, even if later steps fail.
+      #    Uses raw curl so we don't depend on gh being authenticated yet.
+      # =====================================================================
+      - name: "📡 Post early status to issue"
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$HUB_REPO/issues/$ISSUE_NUMBER/comments" \
+            -d "$(jq -n --arg body "⏳ **Agent starting...**
+
+          Workflow triggered by \`${{ github.actor }}\`. Setting up the environment now.
+
+          | Step | Status |
+          |------|--------|
+          | Checkout | 🔄 |
+          | Node.js + Python | 🔄 |
+          | Aider + Vercel CLI | 🔄 |
+          | GitHub auth | 🔄 |
+          | Orchestrator | 🔄 |
+
+          _This comment confirms the runner is live. If you don't see a follow-up within ~2 minutes, check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})._" '{body: $body}')"
+
       # =====================================================================
       # 1. CHECKOUT — pull the hub repo so we have scripts/ available
       # =====================================================================
@@ -78,7 +107,10 @@ jobs:
       # =====================================================================
       - name: "🔑 Authenticate GitHub CLI"
         run: |
-          # gh reads GH_TOKEN from the environment automatically.
+          # Pipe the token into gh auth login so it creates a proper session.
+          # This fixes the "not logged into any GitHub hosts" error that
+          # occurs when only GH_TOKEN env var is set.
+          echo "$GH_TOKEN" | gh auth login --with-token
           gh auth status
 
       - name: "🔑 Verify Vercel authentication"
@@ -87,9 +119,48 @@ jobs:
           vercel whoami --token "$VERCEL_TOKEN"
 
       # =====================================================================
-      # 6. RUN THE ORCHESTRATOR
+      # 6. UPDATE STATUS — Everything is ready, tell the user
+      # =====================================================================
+      - name: "✅ Post setup-complete status"
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$HUB_REPO/issues/$ISSUE_NUMBER/comments" \
+            -d "$(jq -n --arg body "✅ **Environment ready!** Launching orchestrator now...
+
+          | Step | Status |
+          |------|--------|
+          | Checkout | ✅ |
+          | Node.js + Python | ✅ |
+          | Aider + Vercel CLI | ✅ |
+          | GitHub auth | ✅ |
+          | Orchestrator | 🚀 launching... |" '{body: $body}')"
+
+      # =====================================================================
+      # 7. RUN THE ORCHESTRATOR
       # =====================================================================
       - name: "🤖 Launch orchestrator"
         run: |
           chmod +x scripts/orchestrator.sh scripts/github_api.sh
           bash scripts/orchestrator.sh
+
+      # =====================================================================
+      # 8. FAILURE HANDLER — If any step above fails, post an error comment
+      #    so the user isn't left wondering what happened.
+      # =====================================================================
+      - name: "❌ Report failure to issue"
+        if: failure()
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$HUB_REPO/issues/$ISSUE_NUMBER/comments" \
+            -d "$(jq -n --arg body "❌ **Agent setup failed.**
+
+          Something went wrong during environment setup. Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+
+          Common fixes:
+          - Ensure all 4 secrets are configured (\`GH_PAT\`, \`VERCEL_TOKEN\`, \`GEMINI_API_KEY\`, \`GROQ_API_KEY\`)
+          - Verify your \`GH_PAT\` has the required permissions (see README)
+          - Re-apply the \`agent-run\` label to retry" '{body: $body}')"
