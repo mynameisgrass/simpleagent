@@ -35,8 +35,8 @@ source "${SCRIPT_DIR}/github_api.sh"
 # Global configuration
 # ---------------------------------------------------------------------------
 POLL_INTERVAL=15          # seconds between comment polls
-AIDER_MODEL="gemini/gemini-2.5-flash-preview-05-20"  # Primary model
-AIDER_FALLBACK_MODEL="groq/llama-3.3-70b-versatile"  # Fallback model
+AIDER_MODEL="gemini/gemini-3-flash-preview"                # Primary model
+AIDER_FALLBACK_MODEL="gemini/gemini-2.5-flash-lite-preview-06-17"  # Fallback model
 WORK_DIR=""               # Set during Phase 2
 PROJECT_NAME=""           # Set during Phase 1
 LAST_PROCESSED_TS=""      # ISO-8601 watermark for comment polling
@@ -70,26 +70,40 @@ run_aider() {
     --no-auto-commits \
     --yes-always \
     --no-suggest-shell-commands \
+    --no-show-model-warnings \
     --message "$message" 2>&1 | tee /tmp/aider_output.log \
   || exit_code=$?
 
+  # Aider sometimes exits 0 even on API errors (404, rate limit, etc.).
+  # Scan the output for known error signatures to catch these silent failures.
+  if [[ $exit_code -eq 0 ]] && grep -qiE '(NotFoundError|RateLimitError|APIError|APIConnectionError|AuthenticationError|InternalServerError|ServiceUnavailableError|models/.*is not found)' /tmp/aider_output.log 2>/dev/null; then
+    log "⚠️  Aider exited 0 but output contains API errors. Treating as failure."
+    exit_code=1
+  fi
+
   if [[ $exit_code -ne 0 ]]; then
-    log "⚠️  Aider exited with code ${exit_code}. Switching to fallback model (${AIDER_FALLBACK_MODEL})..."
+    log "⚠️  Aider failed with primary model (exit/error ${exit_code}). Switching to fallback (${AIDER_FALLBACK_MODEL})..."
 
     post_comment "$ISSUE_NUMBER" \
-      "⚠️ Primary model hit a limit (exit code \`${exit_code}\`). Retrying with fallback model..."
+      "⚠️ Primary model (\`${AIDER_MODEL}\`) failed. Retrying with fallback model (\`${AIDER_FALLBACK_MODEL}\`)..."
 
     exit_code=0
 
-    # --- Fallback attempt: Groq ---
-    GROQ_API_KEY="${GROQ_API_KEY}" \
+    # --- Fallback attempt ---
+    GEMINI_API_KEY="${GEMINI_API_KEY}" \
     aider \
       --model "$AIDER_FALLBACK_MODEL" \
       --no-auto-commits \
       --yes-always \
       --no-suggest-shell-commands \
+      --no-show-model-warnings \
       --message "$message" 2>&1 | tee /tmp/aider_output.log \
     || exit_code=$?
+
+    # Same output-based error check for the fallback
+    if [[ $exit_code -eq 0 ]] && grep -qiE '(NotFoundError|RateLimitError|APIError|APIConnectionError|AuthenticationError|InternalServerError|ServiceUnavailableError|models/.*is not found)' /tmp/aider_output.log 2>/dev/null; then
+      exit_code=1
+    fi
 
     if [[ $exit_code -ne 0 ]]; then
       log "❌ Fallback model also failed (exit code ${exit_code})."
@@ -163,14 +177,22 @@ log "═════════════════════════
 log " PHASE 1: Booting agent for issue #${ISSUE_NUMBER}"
 log "═══════════════════════════════════════════════════════"
 
-ISSUE_BODY="$(get_issue_body "$ISSUE_NUMBER")"
+ISSUE_BODY="$(get_issue_body "$ISSUE_NUMBER")" || true
+ISSUE_TITLE="$(get_issue_title "$ISSUE_NUMBER")" || true
+
+# If body is empty, use the title as the spec (user might only type a header)
+if [[ -z "$ISSUE_BODY" ]]; then
+  log "Issue body is empty — using title as specification."
+  ISSUE_BODY="$ISSUE_TITLE"
+fi
 
 if [[ -z "$ISSUE_BODY" ]]; then
-  post_comment "$ISSUE_NUMBER" "❌ Issue body is empty. Nothing to build. Exiting."
+  post_comment "$ISSUE_NUMBER" "❌ Issue has no title or body. Nothing to build. Exiting."
   exit 1
 fi
 
-PROJECT_NAME="$(extract_project_name "$ISSUE_BODY")"
+# Prefer title for project name (it's usually shorter/cleaner), fall back to body
+PROJECT_NAME="$(extract_project_name "${ISSUE_TITLE:-$ISSUE_BODY}")"
 
 # Guard against empty project name
 if [[ -z "$PROJECT_NAME" ]]; then
@@ -213,7 +235,10 @@ git config user.email "issueops-agent@users.noreply.github.com"
 # Create the remote repository on GitHub
 log "Creating remote repository: ${REPO_OWNER}/${PROJECT_NAME}"
 CLONE_URL="$(create_repo "$PROJECT_NAME")"
-git remote add origin "$CLONE_URL"
+
+# Use token-authenticated URL so git push works without interactive prompts
+AUTH_CLONE_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO_OWNER}/${PROJECT_NAME}.git"
+git remote add origin "$AUTH_CLONE_URL"
 
 log "Remote repository ready at ${CLONE_URL}"
 
