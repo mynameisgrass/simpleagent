@@ -190,7 +190,12 @@ commit_and_push() {
 }
 
 # ---------------------------------------------------------------------------
-# deploy_vercel — Deploy the current working directory to Vercel production.
+# deploy_vercel — Prepare and deploy the project to Vercel production.
+#
+# Handles three project types:
+#   1. npm/yarn projects (has package.json) — install deps first
+#   2. Static HTML sites — deploy as-is
+#   3. Unknown — deploy as-is, let Vercel figure it out
 #
 # Returns the deployment URL via stdout.
 # ---------------------------------------------------------------------------
@@ -199,19 +204,44 @@ deploy_vercel() {
 
   log "Deploying to Vercel..."
 
-  local deploy_url
-  deploy_url=$(
-    vercel deploy --prod --yes --token "$VERCEL_TOKEN" 2>&1 \
-    | grep -oP 'https://[^\s]+\.vercel\.app' \
-    | tail -1
-  ) || true
+  # --- Step 1: If this is an npm project, install dependencies ---
+  if [[ -f "package.json" ]]; then
+    log "  Found package.json — installing dependencies..."
 
+    # Use npm ci if lockfile exists, otherwise npm install to generate one
+    if [[ -f "package-lock.json" ]]; then
+      npm ci --no-audit --no-fund 2>&1 | tail -3
+    else
+      npm install --no-audit --no-fund 2>&1 | tail -3
+    fi
+
+    # Add node_modules to gitignore if not already there
+    if ! grep -qF 'node_modules' .gitignore 2>/dev/null; then
+      echo 'node_modules/' >> .gitignore
+    fi
+
+    log "  Dependencies installed."
+  fi
+
+  # --- Step 2: Deploy to Vercel ---
+  # Capture full output so we can extract the URL reliably
+  local vercel_output
+  vercel_output=$(vercel deploy --prod --yes --token "$VERCEL_TOKEN" 2>&1) || true
+
+  log "Vercel raw output (last 5 lines):"
+  echo "$vercel_output" | tail -5 >&2
+
+  # --- Step 3: Extract the deployment URL ---
+  local deploy_url
+
+  # Try to find a .vercel.app URL in the output
+  deploy_url=$(echo "$vercel_output" \
+    | grep -oE 'https://[a-zA-Z0-9_-]+\.vercel\.app' \
+    | tail -1) || true
+
+  # Fallback: the last line of successful `vercel` output is often the URL
   if [[ -z "$deploy_url" ]]; then
-    # If we couldn't parse the URL, try a simpler deploy and capture
-    deploy_url=$(
-      vercel --prod --yes --token "$VERCEL_TOKEN" 2>&1 \
-      | tail -1
-    ) || true
+    deploy_url=$(echo "$vercel_output" | grep -oE 'https://[^ ]+' | tail -1) || true
   fi
 
   echo "$deploy_url"
@@ -309,12 +339,22 @@ cat > README.md <<EOF
 ${ISSUE_BODY}
 EOF
 
-# Run Aider with the full issue body as the initial instruction
+# Run Aider with the full issue body as the initial instruction.
+# The prompt explicitly tells Aider to create a Vercel-deployable project.
 run_aider "You are building a new project called '${PROJECT_NAME}'. Here is the full specification from the developer:
 
 ${ISSUE_BODY}
 
-Please generate the complete initial codebase following the specification above. Create all necessary files with production-ready code."
+IMPORTANT DEPLOYMENT RULES — this project will be deployed to Vercel:
+1. All project files MUST be in the current directory (the repo root). Do NOT create a nested project folder.
+2. If the project uses a framework (React, Next.js, Vue, Svelte, etc.):
+   - Create a proper package.json with 'build' and 'dev' scripts in the ROOT.
+   - Include a 'vercel.json' if the framework needs custom config.
+   - For Next.js: use 'npx create-next-app' structure with app/ or pages/ at the root.
+3. If it's a simple static site (HTML/CSS/JS only):
+   - Put index.html at the root. No package.json needed.
+4. Always create all necessary files with production-ready code.
+5. Include a .gitignore with node_modules/ if using npm."
 
 # Commit and push the initial generation
 commit_and_push "feat: initial project generation from issue #${ISSUE_NUMBER}"
