@@ -1,0 +1,9 @@
+# =============================================================================
+# IssueOps Agent Hub — Python Dependencies
+# =============================================================================
+# Aider is the AI coding assistant that generates and modifies code on behalf
+# of the developer.  All other tooling (gh, vercel, jq) is installed at the
+# OS / npm level inside the GitHub Actions workflow.
+# =============================================================================
+
+aider-chat>=0.50.0

@@ -1,0 +1,95 @@
+# =============================================================================
+# ISSUEOPS AGENT HUB — Continuous Coding Workflow
+# =============================================================================
+# Triggered when an issue is labeled "agent-run". Spins up a 3-hour Ubuntu
+# runner that reads issue comments, drives Aider for code generation, pushes
+# to a freshly-created repo, deploys to Vercel, and polls for follow-up
+# instructions until timeout or the "!stop" kill switch.
+# =============================================================================
+
+name: "IssueOps Agent — Continuous Coding"
+
+# ---------------------------------------------------------------------------
+# Trigger: only when an issue receives the "agent-run" label.
+# ---------------------------------------------------------------------------
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  agent-session:
+    # Only fire when the exact label is applied
+    if: github.event.label.name == 'agent-run'
+
+    runs-on: ubuntu-latest
+
+    # Hard ceiling — GitHub will kill the runner after 3 hours
+    timeout-minutes: 180
+
+    # -----------------------------------------------------------------------
+    # Expose every secret the orchestrator needs as env vars so Bash scripts
+    # can reference them without Actions expression syntax.
+    # -----------------------------------------------------------------------
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      REPO_OWNER: ${{ github.repository_owner }}
+      HUB_REPO: ${{ github.repository }}
+
+    steps:
+      # =====================================================================
+      # 1. CHECKOUT — pull the hub repo so we have scripts/ available
+      # =====================================================================
+      - name: "📥 Checkout hub repository"
+        uses: actions/checkout@v4
+
+      # =====================================================================
+      # 2. NODE.JS — required for Vercel CLI
+      # =====================================================================
+      - name: "🟢 Setup Node.js 20"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # =====================================================================
+      # 3. PYTHON — required for Aider
+      # =====================================================================
+      - name: "🐍 Setup Python 3.12"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # =====================================================================
+      # 4. INSTALL DEPENDENCIES
+      # =====================================================================
+      - name: "📦 Install Python dependencies (Aider)"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: "📦 Install Vercel CLI"
+        run: npm install -g vercel@latest
+
+      # =====================================================================
+      # 5. AUTHENTICATE TOOLS
+      # =====================================================================
+      - name: "🔑 Authenticate GitHub CLI"
+        run: |
+          # gh reads GH_TOKEN from the environment automatically.
+          gh auth status
+
+      - name: "🔑 Verify Vercel authentication"
+        run: |
+          # A quick whoami confirms the token works before we enter the loop.
+          vercel whoami --token "$VERCEL_TOKEN"
+
+      # =====================================================================
+      # 6. RUN THE ORCHESTRATOR
+      # =====================================================================
+      - name: "🤖 Launch orchestrator"
+        run: |
+          chmod +x scripts/orchestrator.sh scripts/github_api.sh
+          bash scripts/orchestrator.sh
