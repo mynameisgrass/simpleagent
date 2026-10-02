@@ -35,11 +35,20 @@ source "${SCRIPT_DIR}/github_api.sh"
 # Global configuration
 # ---------------------------------------------------------------------------
 POLL_INTERVAL=15          # seconds between comment polls
-AIDER_MODEL="gemini/gemini-3-flash-preview"                # Primary model
-AIDER_FALLBACK_MODEL="gemini/gemini-2.5-flash-lite-preview-06-17"  # Fallback model
 WORK_DIR=""               # Set during Phase 2
 PROJECT_NAME=""           # Set during Phase 1
 LAST_PROCESSED_TS=""      # ISO-8601 watermark for comment polling
+
+# ---------------------------------------------------------------------------
+# LLM model chain — tried in order. Each entry: "ENV_VAR:model_string"
+#   1. Gemini 3 Flash (primary, via GEMINI_API_KEY) — retried 3 times
+#   2. Groq Llama 3.3 70B (via GROQ_API_KEY)
+#   3. Gemini 2.0 Flash (safe stable model via GEMINI_API_KEY)
+# ---------------------------------------------------------------------------
+MODEL_PRIMARY="gemini/gemini-3-flash-preview"
+MODEL_GROQ="groq/llama-3.3-70b-versatile"
+MODEL_FALLBACK="gemini/gemini-2.0-flash"
+PRIMARY_RETRIES=3
 
 # ---------------------------------------------------------------------------
 # log — Timestamped logging to stderr.
@@ -49,24 +58,34 @@ log() {
 }
 
 # ---------------------------------------------------------------------------
-# run_aider — Execute Aider with the given message.  On failure, fall back
-#             to the Groq-backed model and retry once.
+# _aider_has_errors — Check the output log for known API error signatures.
+#                     Aider often exits 0 even on 404/503/rate-limit errors.
 #
 # Args:
-#   $1 — The natural-language instruction for Aider.
+#   $1  — Path to the Aider output log.
 #
-# Returns: 0 on success, non-zero if both attempts fail.
+# Returns: 0 if errors found, 1 if clean.
 # ---------------------------------------------------------------------------
-run_aider() {
-  local message="$1"
+_aider_has_errors() {
+  grep -qiE '(NotFoundError|RateLimitError|APIError|APIConnectionError|AuthenticationError|InternalServerError|ServiceUnavailableError|models/.*is not found|VertexAIError|Vertex_ai_betaException)' "$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# _try_aider — Run Aider once with a specific model.  Returns 0 on success.
+#
+# Args:
+#   $1 — Model string (e.g. "gemini/gemini-3-flash-preview").
+#   $2 — The natural-language message.
+# ---------------------------------------------------------------------------
+_try_aider() {
+  local model="$1"
+  local message="$2"
   local exit_code=0
 
-  log "Running Aider with primary model (${AIDER_MODEL})..."
+  log "  → Trying model: ${model}"
 
-  # --- Primary attempt: Gemini ---
-  GEMINI_API_KEY="${GEMINI_API_KEY}" \
   aider \
-    --model "$AIDER_MODEL" \
+    --model "$model" \
     --no-auto-commits \
     --yes-always \
     --no-suggest-shell-commands \
@@ -74,47 +93,76 @@ run_aider() {
     --message "$message" 2>&1 | tee /tmp/aider_output.log \
   || exit_code=$?
 
-  # Aider sometimes exits 0 even on API errors (404, rate limit, etc.).
-  # Scan the output for known error signatures to catch these silent failures.
-  if [[ $exit_code -eq 0 ]] && grep -qiE '(NotFoundError|RateLimitError|APIError|APIConnectionError|AuthenticationError|InternalServerError|ServiceUnavailableError|models/.*is not found)' /tmp/aider_output.log 2>/dev/null; then
-    log "⚠️  Aider exited 0 but output contains API errors. Treating as failure."
-    exit_code=1
+  # Catch silent API failures (Aider exits 0 on 404/503)
+  if [[ $exit_code -eq 0 ]] && _aider_has_errors /tmp/aider_output.log; then
+    log "  ✗ Model exited 0 but output contains API errors."
+    return 1
   fi
 
-  if [[ $exit_code -ne 0 ]]; then
-    log "⚠️  Aider failed with primary model (exit/error ${exit_code}). Switching to fallback (${AIDER_FALLBACK_MODEL})..."
+  return "$exit_code"
+}
 
-    post_comment "$ISSUE_NUMBER" \
-      "⚠️ Primary model (\`${AIDER_MODEL}\`) failed. Retrying with fallback model (\`${AIDER_FALLBACK_MODEL}\`)..."
+# ---------------------------------------------------------------------------
+# run_aider — Execute Aider with the hybrid retry chain:
+#   1. Primary (gemini-3-flash) — up to 3 retries with backoff
+#   2. Groq (llama-3.3-70b)    — 1 attempt
+#   3. Fallback (gemini-2.0-flash) — 1 attempt
+#
+# Args:
+#   $1 — The natural-language instruction for Aider.
+#
+# Returns: 0 on success, 1 if entire chain fails.
+# ---------------------------------------------------------------------------
+run_aider() {
+  local message="$1"
 
-    exit_code=0
+  # ----- Stage 1: Primary model with retries -----
+  log "Running Aider — Stage 1: ${MODEL_PRIMARY} (up to ${PRIMARY_RETRIES} attempts)..."
+  local attempt=1
+  while [[ $attempt -le $PRIMARY_RETRIES ]]; do
+    log "  Attempt ${attempt}/${PRIMARY_RETRIES}..."
 
-    # --- Fallback attempt ---
-    GEMINI_API_KEY="${GEMINI_API_KEY}" \
-    aider \
-      --model "$AIDER_FALLBACK_MODEL" \
-      --no-auto-commits \
-      --yes-always \
-      --no-suggest-shell-commands \
-      --no-show-model-warnings \
-      --message "$message" 2>&1 | tee /tmp/aider_output.log \
-    || exit_code=$?
-
-    # Same output-based error check for the fallback
-    if [[ $exit_code -eq 0 ]] && grep -qiE '(NotFoundError|RateLimitError|APIError|APIConnectionError|AuthenticationError|InternalServerError|ServiceUnavailableError|models/.*is not found)' /tmp/aider_output.log 2>/dev/null; then
-      exit_code=1
+    if _try_aider "$MODEL_PRIMARY" "$message"; then
+      log "✅ Aider completed successfully (${MODEL_PRIMARY}, attempt ${attempt})."
+      return 0
     fi
 
-    if [[ $exit_code -ne 0 ]]; then
-      log "❌ Fallback model also failed (exit code ${exit_code})."
-      post_comment "$ISSUE_NUMBER" \
-        "❌ Both primary and fallback models failed.  Will retry on the next comment."
-      return "$exit_code"
+    log "  ✗ Attempt ${attempt} failed."
+    attempt=$((attempt + 1))
+
+    # Backoff: 5s, 10s before retries (skip sleep on last failure)
+    if [[ $attempt -le $PRIMARY_RETRIES ]]; then
+      local wait_secs=$(( (attempt - 1) * 5 ))
+      log "  Waiting ${wait_secs}s before retry..."
+      sleep "$wait_secs"
     fi
+  done
+
+  # ----- Stage 2: Groq -----
+  log "Running Aider — Stage 2: ${MODEL_GROQ}..."
+  post_comment "$ISSUE_NUMBER" \
+    "⚠️ Primary model (\`${MODEL_PRIMARY}\`) failed after ${PRIMARY_RETRIES} attempts. Trying Groq..."
+
+  if _try_aider "$MODEL_GROQ" "$message"; then
+    log "✅ Aider completed successfully (${MODEL_GROQ})."
+    return 0
   fi
 
-  log "✅ Aider completed successfully."
-  return 0
+  # ----- Stage 3: Stable Gemini fallback -----
+  log "Running Aider — Stage 3: ${MODEL_FALLBACK}..."
+  post_comment "$ISSUE_NUMBER" \
+    "⚠️ Groq also failed. Last resort: \`${MODEL_FALLBACK}\`..."
+
+  if _try_aider "$MODEL_FALLBACK" "$message"; then
+    log "✅ Aider completed successfully (${MODEL_FALLBACK})."
+    return 0
+  fi
+
+  # ----- All failed -----
+  log "❌ All models in the chain failed."
+  post_comment "$ISSUE_NUMBER" \
+    "❌ All models failed (\`${MODEL_PRIMARY}\` ×${PRIMARY_RETRIES}, \`${MODEL_GROQ}\`, \`${MODEL_FALLBACK}\`). Will retry on the next comment."
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -205,11 +253,12 @@ log "Project name resolved to: ${PROJECT_NAME}"
 post_comment "$ISSUE_NUMBER" \
   "🚀 Agent booted. Generating project **\`${PROJECT_NAME}\`**...
 
-**Configuration:**
-- 🧠 Primary model: \`${AIDER_MODEL}\`
-- 🔄 Fallback model: \`${AIDER_FALLBACK_MODEL}\`
-- ⏱️ Session timeout: 3 hours
-- 🔁 Poll interval: ${POLL_INTERVAL}s
+**LLM Chain:**
+1. 🧠 \`${MODEL_PRIMARY}\` (×${PRIMARY_RETRIES} retries)
+2. 🔄 \`${MODEL_GROQ}\` (Groq)
+3. 🛡️ \`${MODEL_FALLBACK}\` (stable fallback)
+
+⏱️ Session: 3 hours | 🔁 Poll: ${POLL_INTERVAL}s
 
 I'll read your issue, generate the initial code, push it to a new repo, and deploy to Vercel. Then I'll watch for your follow-up comments."
 
@@ -320,7 +369,7 @@ while true; do
     LAST_PROCESSED_TS="$COMMENT_TS"
 
     # Skip comments posted by the bot itself (they contain our markers)
-    if echo "$COMMENT_BODY" | grep -qE '(🚀 Agent booted|✅ Code updated|✅ Initial code|🛑 Terminating|⚠️ Primary model)'; then
+    if echo "$COMMENT_BODY" | grep -qE '(🚀 Agent booted|✅ Code updated|✅ Initial code|✅ \*\*Environment|🛑 Terminating|⚠️ Primary model|⚠️ Groq also|⚠️ Code generation|🔄 Processing your|❌ (All models|Both primary|Agent setup)|⏳ \*\*Agent starting|> Re: \[comment\])'; then
       log "Skipping bot-authored comment #${COMMENT_ID}"
       continue
     fi
